@@ -22,13 +22,14 @@
 #include "AP_WindVane_RPM.h"
 #include "AP_WindVane_SITL.h"
 #include "AP_WindVane_NMEA.h"
+#include "AP_WindVane_AS5600.h"
 
 const AP_Param::GroupInfo AP_WindVane::var_info[] = {
 
     // @Param: TYPE
     // @DisplayName: Wind Vane Type
     // @Description: Wind Vane type
-    // @Values: 0:None,1:Heading when armed,2:RC input offset heading when armed,3:Analog,4:NMEA,10:SITL true,11:SITL apparent
+    // @Values: 0:None,1:Heading when armed,2:RC input offset heading when armed,3:Analog,4:NMEA,5:AS5600_I2C,10:SITL
     // @User: Standard
     // @RebootRequired: True
     AP_GROUPINFO_FLAGS("TYPE", 1, AP_WindVane, _direction_type, 0, AP_PARAM_FLAG_ENABLE),
@@ -209,6 +210,14 @@ void AP_WindVane::init(const AP_SerialManager& serial_manager)
         case WindVaneType::WINDVANE_NMEA:
             _direction_driver = new AP_WindVane_NMEA(*this);
             _direction_driver->init(serial_manager);
+            break;
+        case WindVaneType::WINDVANE_AS5600:
+            FOREACH_I2C(i) {
+                _direction_driver = AP_WindVane_AS5600::detect(*this, hal.i2c_mgr->get_device(i, AP_WINDVANE_AS5600_DEFAULT_ADDR));
+                if(_direction_driver) {
+                    break;
+                }
+            }
             break;
     }
 

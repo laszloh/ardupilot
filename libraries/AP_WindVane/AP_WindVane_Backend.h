@@ -16,6 +16,7 @@
 
 #include "AP_WindVane.h"
 
+#include <AP_Common/AP_Common.h>
 #include <GCS_MAVLink/GCS.h>
 #include <Filter/Filter.h>
 
@@ -43,6 +44,7 @@ protected:
     void direction_update_frontend(float apparent_angle_ef);
 
     AP_WindVane &_frontend;
+    HAL_Semaphore _sem;
 
 private:
     // low pass filters of direction and speed

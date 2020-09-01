@@ -29,12 +29,21 @@ class AP_Compass_BMM150 : public AP_Compass_Backend
 public:
     static AP_Compass_Backend *probe(AP_HAL::OwnPtr<AP_HAL::I2CDevice> dev, enum Rotation rotation);
 
+    /* Probe for BMM150 on auxiliary bus of BMI160, connected through I2C */
+    static AP_Compass_Backend *probe_bmi160(AP_HAL::OwnPtr<AP_HAL::I2CDevice> dev,
+                                             enum Rotation rotation);
+
+    /* Probe for BMM150 on auxiliary bus of BMI160, connected through SPI */
+    static AP_Compass_Backend *probe_bmi160(uint8_t bmi160_instance,
+                                             enum Rotation rotation);
     void read() override;
 
     static constexpr const char *name = "BMM150";
 
+    virtual ~AP_Compass_BMM150();
+
 private:
-    AP_Compass_BMM150(AP_HAL::OwnPtr<AP_HAL::Device> dev, enum Rotation rotation);
+    AP_Compass_BMM150(AP_BMM150_BusDriver *bus, enum Rotation rotation);
 
     /**
      * Device periodic callback to read data from the sensor.
@@ -45,7 +54,7 @@ private:
     int16_t _compensate_xy(int16_t xy, uint32_t rhall, int32_t txy1, int32_t txy2);
     int16_t _compensate_z(int16_t z, uint32_t rhall);
 
-    AP_HAL::OwnPtr<AP_HAL::Device> _dev;
+    AP_BMM150_BusDriver *_bus;
 
     uint8_t _compass_instance;
 
@@ -64,6 +73,84 @@ private:
     } _dig;
 
     uint32_t _last_read_ms;
-    AP_HAL::Util::perf_counter_t _perf_err;
+    bool _initialized;
     enum Rotation _rotation;
+};
+
+class AP_BMM150_BusDriver
+{
+public:
+    virtual ~AP_BMM150_BusDriver() { }
+
+    virtual bool block_read(uint8_t reg, uint8_t *buf, uint32_t size) = 0;
+    virtual bool register_read(uint8_t reg, uint8_t *val) = 0;
+    virtual bool register_write(uint8_t reg, uint8_t val) = 0;
+
+    virtual AP_HAL::Semaphore *get_semaphore() = 0;
+
+    virtual bool configure() { return true; }
+    virtual bool start_measurements() { return true; }
+    virtual AP_HAL::Device::PeriodicHandle register_periodic_callback(uint32_t, AP_HAL::Device::PeriodicCb) = 0;
+
+    // set device type within a device class
+    virtual void set_device_type(uint8_t devtype) = 0;
+
+    // return 24 bit bus identifier
+    virtual uint32_t get_bus_id(void) const = 0;
+};
+
+class AP_BMM150_BusDriver_HALDevice: public AP_BMM150_BusDriver
+{
+public:
+    AP_BMM150_BusDriver_HALDevice(AP_HAL::OwnPtr<AP_HAL::I2CDevice> dev);
+
+    virtual bool block_read(uint8_t reg, uint8_t *buf, uint32_t size) override;
+    virtual bool register_read(uint8_t reg, uint8_t *val) override;
+    virtual bool register_write(uint8_t reg, uint8_t val) override;
+
+    virtual AP_HAL::Semaphore  *get_semaphore() override;
+    AP_HAL::Device::PeriodicHandle register_periodic_callback(uint32_t period_usec, AP_HAL::Device::PeriodicCb) override;
+
+    // set device type within a device class
+    void set_device_type(uint8_t devtype) override {
+        _dev->set_device_type(devtype);
+    }
+
+    // return 24 bit bus identifier
+    uint32_t get_bus_id(void) const override {
+        return _dev->get_bus_id();
+    }
+    
+private:
+    AP_HAL::OwnPtr<AP_HAL::I2CDevice> _dev;
+};
+
+class AP_BMM150_BusDriver_Auxiliary : public AP_BMM150_BusDriver
+{
+public:
+    AP_BMM150_BusDriver_Auxiliary(AP_InertialSensor &ins, uint8_t backend_id,
+                                  uint8_t backend_instance, uint8_t addr);
+    ~AP_BMM150_BusDriver_Auxiliary();
+
+    bool block_read(uint8_t reg, uint8_t *buf, uint32_t size) override;
+    bool register_read(uint8_t reg, uint8_t *val) override;
+    bool register_write(uint8_t reg, uint8_t val) override;
+
+    AP_HAL::Device::PeriodicHandle register_periodic_callback(uint32_t period_usec, AP_HAL::Device::PeriodicCb) override;
+    
+    AP_HAL::Semaphore  *get_semaphore() override;
+
+    bool configure() override;
+    bool start_measurements() override;
+
+    // set device type within a device class
+    void set_device_type(uint8_t devtype) override;
+
+    // return 24 bit bus identifier
+    uint32_t get_bus_id(void) const override;
+    
+private:
+    AuxiliaryBus *_bus;
+    AuxiliaryBusSlave *_slave;
+    bool _started;
 };

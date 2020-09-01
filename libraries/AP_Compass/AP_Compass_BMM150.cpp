@@ -22,6 +22,8 @@
 
 #include <AP_HAL/utility/sparse-endian.h>
 #include <AP_Math/AP_Math.h>
+#include <AP_InertialSensor/AP_InertialSensor_BMI160.h>
+
 #include <stdio.h>
 
 #define CHIP_ID_REG 0x40
@@ -61,6 +63,8 @@
 
 #define MEASURE_TIME_USEC 16667
 
+#define BMM150_DEFAULT_I2C_ADDRESS 0x10
+
 extern const AP_HAL::HAL &hal;
 
 AP_Compass_Backend *AP_Compass_BMM150::probe(AP_HAL::OwnPtr<AP_HAL::I2CDevice> dev, enum Rotation rotation)
@@ -68,6 +72,11 @@ AP_Compass_Backend *AP_Compass_BMM150::probe(AP_HAL::OwnPtr<AP_HAL::I2CDevice> d
     if (!dev) {
         return nullptr;
     }
+    AP_BMM150_BusDriver *bus = new AP_BMM150_BusDriver_HALDevice(std::move(dev));
+    if (!bus) {
+        return nullptr;
+    }
+
     AP_Compass_BMM150 *sensor = new AP_Compass_BMM150(std::move(dev), rotation);
     if (!sensor || !sensor->init()) {
         delete sensor;
@@ -77,9 +86,48 @@ AP_Compass_Backend *AP_Compass_BMM150::probe(AP_HAL::OwnPtr<AP_HAL::I2CDevice> d
     return sensor;
 }
 
-AP_Compass_BMM150::AP_Compass_BMM150(AP_HAL::OwnPtr<AP_HAL::Device> dev, enum Rotation rotation)
-    : _dev(std::move(dev)), _rotation(rotation)
+/* Probe for BMM150 on auxiliary bus of BMI160, connected through I2C */
+AP_Compass_Backend *AP_Compass_BMM150::probe_bmi160(AP_HAL::OwnPtr<AP_HAL::I2CDevice> dev,
+                                                    enum Rotation rotation)
 {
+    if (!dev) {
+        return nullptr;
+    }
+    AP_InertialSensor &ins = *AP_InertialSensor::get_singleton();
+    ins.detect_backends();
+
+    return probe(std::move(dev), rotation);
+}
+
+/* Probe for BMM150 on auxiliary bus of BMI160, connected through SPI */
+AP_Compass_Backend *AP_Compass_BMM150::probe_bmi160(uint8_t bmi160_instance,
+                                                    enum Rotation rotation)
+{
+    AP_InertialSensor &ins = *AP_InertialSensor::get_singleton();
+
+    AP_BMM150_BusDriver *bus =
+        new AP_BM150_BusDriver_Auxiliary(ins, HAL_INS_MPU9250_SPI, bmi160_instance, BMM150_DEFAULT_I2C_ADDRESS);
+    if (!bus) {
+        return nullptr;
+    }
+
+    AP_Compass_BMM150 *sensor = new AP_Compass_BMM150(bus, rotation);
+    if (!sensor || !sensor->init()) {
+        delete sensor;
+        return nullptr;
+    }
+
+    return sensor;
+}
+
+AP_Compass_BMM150::AP_Compass_BMM150(AP_BMM150_BusDriver *bus, enum Rotation rotation)
+    : _bus(bus), _rotation(rotation)
+{
+}
+
+AP_Compass_BMM150::~AP_Compass_BMM150()
+{
+    delete _bus;
 }
 
 bool AP_Compass_BMM150::_load_trim_values()
@@ -142,14 +190,71 @@ bool AP_Compass_BMM150::init()
     uint8_t val = 0;
     bool ret;
 
-    _dev->get_semaphore()->take_blocking();
+    AP_HAL::Semaphore *bus_sem = _bus->get_semaphore();
 
+    if (!bus_sem) {
+        return false;
+    }
+    bus_sem->take_blocking();
+
+// ToDO: move to configure
+#if 0
     // 10 retries for init
-    _dev->set_retries(10);
+    _bus->set_retries(10);
 
     // use checked registers to cope with bus errors
-    _dev->setup_checked_registers(4);
+    _bus->setup_checked_registers(4);
+#endif
+
+    if(!_bus->configure()) {
+        hal.console->printf("BMM150: Could not configure the bus\n");
+        goto bus_error;
+    }
+
+    if(!_bus->get_bus_id()) {
+        hal.console->printf("BMM150: Wrong id\n");
+        goto bus_error;
+    }
+
+    if (!_calibrate()) {
+        hal.console->printf("BMM150: Could not read calibration data\n");
+        goto bus_error;
+    }
+
+    if (!_setup_mode()) {
+        hal.console->printf("BMM150: Could not setup mode\n");
+        goto bus_error;
+    }
+
+    if (!_bus->start_measurements()) {
+        hal.console->printf("BMM150: Could not start measurements\n");
+        goto bus_error;
+    }
+
+    _initialized = true;
+
+    /* register the compass instance in the frontend */
+    _bus->set_device_type(DEVTYPE_BMM150);
+    if (!register_compass(_bus->get_bus_id(), _compass_instance)) {
+        goto bus_error;
+    }
+    set_dev_id(_compass_instance, _bus->get_bus_id());
+
+    set_rotation(_compass_instance, _rotation);
+    bus_sem->give();
+
+    _bus->register_periodic_callback(MEASURE_TIME_USEC, FUNCTOR_BIND_MEMBER(&AP_Compass_BMM150::_update, void));
+
+    _last_read_ms = AP_HAL::millis();
+
+    return true;
+
+bus_error:
+    bus_sem->give();
+    return false;
     
+// ToDo: move to chip id
+#if 0
     int8_t boot_tries = 4;
     while (boot_tries--) {
         /* Do a soft reset */
@@ -181,12 +286,18 @@ bool AP_Compass_BMM150::init()
     if (-1 == boot_tries) {
         goto bus_error;
     }
+#endif
 
+// ToDO: move to calibrate
+#if 0
     ret = _load_trim_values();
     if (!ret) {
         goto bus_error;
     }
+#endif
 
+// ToDO: move to setup
+#if 0
     /*
      * Recommended preset for high accuracy:
      * - Rep X/Y = 47
@@ -202,12 +313,18 @@ bool AP_Compass_BMM150::init()
     if (!ret) {
         goto bus_error;
     }
+#endif
+
+//ToDO: move to start measurment
+#if 0
     /* Change operation mode from sleep to normal and set ODR */
     ret = _dev->write_register(OP_MODE_SELF_TEST_ODR_REG, NORMAL_MODE | ODR_30HZ, true);
     if (!ret) {
         goto bus_error;
     }
+#endif
 
+#if 0
     _dev->get_semaphore()->give();
 
     /* register the compass instance in the frontend */
@@ -236,6 +353,7 @@ bus_error:
     hal.console->printf("BMM150: Bus communication error\n");
     _dev->get_semaphore()->give();
     return false;
+#endif
 }
 
 /*
@@ -325,4 +443,131 @@ void AP_Compass_BMM150::read()
 {
     drain_accumulated_samples(_compass_instance);
 }
+
+
+/* AP_HAL::I2CDevice implementation of the BMM150 */
+AP_BMM150_BusDriver_HALDevice::AP_BMM150_BusDriver_HALDevice(AP_HAL::OwnPtr<AP_HAL::I2CDevice> dev)
+    : _dev(std::move(dev))
+{
+}
+
+bool AP_BMM150_BusDriver_HALDevice::block_read(uint8_t reg, uint8_t *buf, uint32_t size)
+{
+    return _dev->read_registers(reg, buf, size);
+}
+
+bool AP_BMM150_BusDriver_HALDevice::register_read(uint8_t reg, uint8_t *val)
+{
+    return _dev->read_registers(reg, val, 1);
+}
+
+bool AP_BMM150_BusDriver_HALDevice::register_write(uint8_t reg, uint8_t val)
+{
+    return _dev->write_register(reg, val);
+}
+
+AP_HAL::Semaphore *AP_BMM150_BusDriver_HALDevice::get_semaphore()
+{
+    return _dev->get_semaphore();
+}
+
+AP_HAL::Device::PeriodicHandle AP_BMM150_BusDriver_HALDevice::register_periodic_callback(uint32_t period_usec, AP_HAL::Device::PeriodicCb cb)
+{
+    return _dev->register_periodic_callback(period_usec, cb);
+}
+
+
+/* AK8963 on an auxiliary bus of IMU driver */
+AP_BMM150_BusDriver_Auxiliary::AP_BMM150_BusDriver_Auxiliary(AP_InertialSensor &ins, uint8_t backend_id,
+                                                             uint8_t backend_instance, uint8_t addr)
+{
+    /*
+     * Only initialize members. Fails are handled by configure or while
+     * getting the semaphore
+     */
+    _bus = ins.get_auxiliary_bus(backend_id, backend_instance);
+    if (!_bus) {
+        return;
+    }
+
+    _slave = _bus->request_next_slave(addr);
+}
+
+AP_BMM150_BusDriver_Auxiliary::~AP_BMM150_BusDriver_Auxiliary()
+{
+    /* After started it's owned by AuxiliaryBus */
+    if (!_started) {
+        delete _slave;
+    }
+}
+
+bool AP_BMM150_BusDriver_Auxiliary::block_read(uint8_t reg, uint8_t *buf, uint32_t size)
+{
+    if (_started) {
+        /*
+         * We can only read a block when reading the block of sample values -
+         * calling with any other value is a mistake
+         */
+        assert(reg == AK8963_HXL);
+
+        int n = _slave->read(buf);
+        return n == static_cast<int>(size);
+    }
+
+    int r = _slave->passthrough_read(reg, buf, size);
+
+    return r > 0 && static_cast<uint32_t>(r) == size;
+}
+
+bool AP_BMM150_BusDriver_Auxiliary::register_read(uint8_t reg, uint8_t *val)
+{
+    return _slave->passthrough_read(reg, val, 1) == 1;
+}
+
+bool AP_BMM150_BusDriver_Auxiliary::register_write(uint8_t reg, uint8_t val)
+{
+    return _slave->passthrough_write(reg, val) == 1;
+}
+
+AP_HAL::Semaphore *AP_BMM150_BusDriver_Auxiliary::get_semaphore()
+{
+    return _bus ? _bus->get_semaphore() : nullptr;
+}
+
+bool AP_BMM150_BusDriver_Auxiliary::configure()
+{
+    if (!_bus || !_slave) {
+        return false;
+    }
+    return true;
+}
+
+bool AP_BMM150_BusDriver_Auxiliary::start_measurements()
+{
+    if (_bus->register_periodic_read(_slave, AK8963_HXL, sizeof(sample_regs)) < 0) {
+        return false;
+    }
+
+    _started = true;
+
+    return true;
+}
+
+AP_HAL::Device::PeriodicHandle AP_BMM150_BusDriver_Auxiliary::register_periodic_callback(uint32_t period_usec, AP_HAL::Device::PeriodicCb cb)
+{
+    return _bus->register_periodic_callback(period_usec, cb);
+}
+
+// set device type within a device class
+void AP_BMm150_BusDriver_Auxiliary::set_device_type(uint8_t devtype)
+{
+    _bus->set_device_type(devtype);
+}
+
+// return 24 bit bus identifier
+uint32_t AP_BMm150_BusDriver_Auxiliary::get_bus_id(void) const
+{
+    return _bus->get_bus_id();
+}
+
 

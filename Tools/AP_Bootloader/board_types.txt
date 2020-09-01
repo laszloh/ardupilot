@@ -100,3 +100,4 @@ AP_HW_TWD_H7                         1018
 AP_HW_MAMBA405                       1019
 AP_HW_H31_PIXC4                      1020
 AP_HW_QioTekZealotF427               1021
+AP_HW_BOATPILOT_RG65                 1022

@@ -19,9 +19,22 @@
 #include <AP_HAL/AP_HAL.h>
 
 #if CONFIG_HAL_BOARD == HAL_BOARD_LINUX
+#include <AP_HAL_Linux/GPIO.h>
+#if CONFIG_HAL_BOARD_SUBTYPE == HAL_BOARD_SUBTYPE_LINUX_AERO
+#    define BMI160_INT1_GPIO AERO_GPIO_BMI160_INT1
+#else
+#    define BMI160_INT1_GPIO -1
+#endif
+#endif
+
+#if CONFIG_HAL_BOARD == HAL_BOARD_CHIBIOS
+// hal.console can be accessed from bus threads on ChibiOS
+#define debug(fmt, args ...)  do {hal.console->printf("MPU: " fmt "\n", ## args); } while(0)
+#else
+#define debug(fmt, args ...)  do {printf("MPU: " fmt "\n", ## args); } while(0)
+#endif
 
 #include <AP_HAL/utility/sparse-endian.h>
-#include <AP_HAL_Linux/GPIO.h>
 #include <AP_Math/AP_Math.h>
 
 #include "AP_InertialSensor_BMI160.h"
@@ -52,9 +65,11 @@
 #define     BMI160_INT1_OUTPUT_EN 0x08
 #define BMI160_REG_INT_MAP_1 0x56
 #define     BMI160_INT_MAP_INT1_FWM 0x40
+#define BMI160_REG_IF_CONF 0x6B
 #define BMI160_REG_CMD 0x7E
 #define     BMI160_CMD_ACCEL_NORMAL_POWER_MODE 0x11
 #define     BMI160_CMD_GYRO_NORMAL_POWER_MODE 0x15
+#define     BMI160_CMD_AUX_NORMAL_MODE 0x19
 #define     BMI160_CMD_FIFO_FLUSH 0xB0
 #define     BMI160_CMD_SOFTRESET 0xB6
 
@@ -98,12 +113,6 @@
 
 #define BMI160_READ_FLAG 0x80
 #define BMI160_HARDWARE_INIT_MAX_TRIES 5
-
-#if CONFIG_HAL_BOARD_SUBTYPE == HAL_BOARD_SUBTYPE_LINUX_AERO
-#    define BMI160_INT1_GPIO AERO_GPIO_BMI160_INT1
-#else
-#    define BMI160_INT1_GPIO -1
-#endif
 
 extern const AP_HAL::HAL& hal;
 
@@ -493,4 +502,202 @@ bool AP_InertialSensor_BMI160::_init()
     return ret;
 }
 
-#endif
+AuxiliaryBus *AP_InertialSensor_BMI160::get_auxiliary_bus()
+{
+    if (_auxiliary_bus) {
+        return _auxiliary_bus;
+    }
+
+    if (_has_auxiliary_bus()) {
+        _auxiliary_bus = new AP_BMI160_AuxiliaryBus(*this, _dev->get_bus_id());
+    }
+
+    return _auxiliary_bus;
+}
+
+
+AP_BMI160_AuxiliaryBusSlave::AP_BMI160_AuxiliaryBusSlave(AuxiliaryBus &bus, uint8_t addr,
+                                                         uint8_t instance)
+    : AuxiliaryBusSlave(bus, addr, instance)
+    , _mpu_addr(MPUREG_I2C_SLV0_ADDR + _instance * 3)
+    , _mpu_reg(_mpu_addr + 1)
+    , _mpu_ctrl(_mpu_addr + 2)
+    , _mpu_do(MPUREG_I2C_SLV0_DO + _instance)
+{
+}
+
+int AP_BMI160_AuxiliaryBusSlave::_set_passthrough(uint8_t reg, uint8_t size,
+                                                  uint8_t *out)
+{
+    auto &backend = AP_InertialSensor_Invensense::from(_bus.get_backend());
+    uint8_t addr;
+
+    /* Ensure the slave read/write is disabled before changing the registers */
+    backend._register_write(_mpu_ctrl, 0);
+
+    if (out) {
+        backend._register_write(_mpu_do, *out);
+        addr = _addr;
+    } else {
+        addr = _addr | BIT_READ_FLAG;
+    }
+
+    backend._register_write(_mpu_addr, addr);
+    backend._register_write(_mpu_reg, reg);
+    backend._register_write(_mpu_ctrl, BIT_I2C_SLVX_EN | size);
+
+    return 0;
+}
+
+int AP_BMI160_AuxiliaryBusSlave::passthrough_read(uint8_t reg, uint8_t *buf,
+                                                   uint8_t size)
+{
+    assert(buf);
+
+    if (_registered) {
+        hal.console->printf("Error: can't passthrough when slave is already configured\n");
+        return -1;
+    }
+
+    int r = _set_passthrough(reg, size);
+    if (r < 0) {
+        return r;
+    }
+
+    /* wait the value to be read from the slave and read it back */
+    hal.scheduler->delay(10);
+
+    auto &backend = AP_InertialSensor_Invensense::from(_bus.get_backend());
+    if (!backend._block_read(MPUREG_EXT_SENS_DATA_00 + _ext_sens_data, buf, size)) {
+        return -1;
+    }
+
+    /* disable new reads */
+    backend._register_write(_mpu_ctrl, 0);
+
+    return size;
+}
+
+int AP_BMI160_AuxiliaryBusSlave::passthrough_write(uint8_t reg, uint8_t val)
+{
+    if (_registered) {
+        hal.console->printf("Error: can't passthrough when slave is already configured\n");
+        return -1;
+    }
+
+    int r = _set_passthrough(reg, 1, &val);
+    if (r < 0) {
+        return r;
+    }
+
+    /* wait the value to be written to the slave */
+    hal.scheduler->delay(10);
+
+    auto &backend = AP_InertialSensor_Invensense::from(_bus.get_backend());
+
+    /* disable new writes */
+    backend._register_write(_mpu_ctrl, 0);
+
+    return 1;
+}
+
+int AP_BMI160_AuxiliaryBusSlave::read(uint8_t *buf)
+{
+    if (!_registered) {
+        hal.console->printf("Error: can't read before configuring slave\n");
+        return -1;
+    }
+
+    auto &backend = AP_InertialSensor_Invensense::from(_bus.get_backend());
+    if (!backend._block_read(MPUREG_EXT_SENS_DATA_00 + _ext_sens_data, buf, _sample_size)) {
+        return -1;
+    }
+
+    return _sample_size;
+}
+
+/* Invensense provides up to 5 slave devices, but the 5th is way too different to
+ * configure and is seldom used */
+AP_BMI160_AuxiliaryBus::AP_BMI160_AuxiliaryBus(AP_InertialSensor_Invensense &backend, uint32_t devid)
+    : AuxiliaryBus(backend, 4, devid)
+{
+}
+
+AP_HAL::Semaphore *AP_BMI160_AuxiliaryBus::get_semaphore()
+{
+    return static_cast<AP_BMI160_Invensense&>(_ins_backend)._dev->get_semaphore();
+}
+
+AuxiliaryBusSlave *AP_BMI160_AuxiliaryBus::_instantiate_slave(uint8_t addr, uint8_t instance)
+{
+    /* Enable slaves on Invensense if this is the first time */
+    if (_ext_sens_data == 0) {
+        _configure_slaves();
+    }
+
+    return new AP_BMI160_AuxiliaryBusSlave(*this, addr, instance);
+}
+
+void AP_BMI160_AuxiliaryBus::_configure_slaves()
+{
+    auto &backend = AP_InertialSensor_BMI160::from(_ins_backend);
+    uint8_t if_conf = 0;
+    bool ret;
+
+    backend._dev->get_semaphore()->take_blocking();
+
+    /* set the aux power mode to normal */
+    backend._dev->write_register(BMI160_REG_CMD,
+                                 BMI160_CMD_AUX_NORMAL_MODE);
+    backend.hal.scheduler->delay(BMI160_POWERUP_DELAY_MSEC);
+
+    /* Enable second interface in I2C mode */
+    backend._dev->read_registers(BMI160_REG_IF_CONF, &if_conf, 1);
+    if_conf |= (1 << 5);
+    backend._dev->write_register(BMI160_REG_IF_CONF, if_conf);
+
+    
+
+    /* Enable the I2C master to slaves on the auxiliary I2C bus*/
+    if (!(backend._last_stat_user_ctrl & BIT_USER_CTRL_I2C_MST_EN)) {
+        backend._last_stat_user_ctrl |= BIT_USER_CTRL_I2C_MST_EN;
+        backend._register_write(MPUREG_USER_CTRL, backend._last_stat_user_ctrl);
+    }
+
+    /* stop condition between reads; clock at 400kHz */
+    backend._register_write(MPUREG_I2C_MST_CTRL,
+                            BIT_I2C_MST_P_NSR | BIT_I2C_MST_CLK_400KHZ);
+
+    /* Hard-code divider for internal sample rate, 1 kHz, resulting in a
+     * sample rate of 100Hz */
+    backend._register_write(MPUREG_I2C_SLV4_CTRL, 9);
+
+    /* All slaves are subject to the sample rate */
+    backend._register_write(MPUREG_I2C_MST_DELAY_CTRL,
+                            BIT_I2C_SLV0_DLY_EN | BIT_I2C_SLV1_DLY_EN |
+                            BIT_I2C_SLV2_DLY_EN | BIT_I2C_SLV3_DLY_EN);
+
+    backend._dev->get_semaphore()->give();
+}
+
+int AP_BMI160_AuxiliaryBus::_configure_periodic_read(AuxiliaryBusSlave *slave,
+                                                     uint8_t reg, uint8_t size)
+{
+    if (_ext_sens_data + size > MAX_EXT_SENS_DATA) {
+        return -1;
+    }
+
+    AP_BMI160_AuxiliaryBusSlave *mpu_slave =
+        static_cast<AP_BMI160_AuxiliaryBusSlave*>(slave);
+    mpu_slave->_set_passthrough(reg, size);
+    mpu_slave->_ext_sens_data = _ext_sens_data;
+    _ext_sens_data += size;
+
+    return 0;
+}
+
+AP_HAL::Device::PeriodicHandle AP_BMI160_AuxiliaryBus::register_periodic_callback(uint32_t period_usec, AP_HAL::Device::PeriodicCb cb)
+{
+    auto &backend = AP_InertialSensor_Invensense::from(_ins_backend);
+    return backend._dev->register_periodic_callback(period_usec, cb);
+}

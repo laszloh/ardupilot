@@ -24,6 +24,11 @@
 #include "AP_Compass.h"
 #include "AP_Compass_Backend.h"
 
+class AP_BMM150_BusDriver;
+class AP_InertialSensor;
+class AuxiliaryBus;
+class AuxiliaryBusSlave;
+
 class AP_Compass_BMM150 : public AP_Compass_Backend
 {
 public:
@@ -44,6 +49,10 @@ public:
 
 private:
     AP_Compass_BMM150(AP_BMM150_BusDriver *bus, enum Rotation rotation);
+    bool _reset();
+    bool _setup_mode();
+    bool _check_id();
+    bool _calibrate();
 
     /**
      * Device periodic callback to read data from the sensor.
@@ -75,6 +84,7 @@ private:
     uint32_t _last_read_ms;
     bool _initialized;
     enum Rotation _rotation;
+    AP_HAL::Util::perf_counter_t _perf_err;
 };
 
 class AP_BMM150_BusDriver

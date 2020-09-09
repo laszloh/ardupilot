@@ -14,6 +14,7 @@
  * You should have received a copy of the GNU General Public License along
  * with this program.  If not, see <http://www.gnu.org/licenses/>.
  */
+#include <assert.h>
 #include <utility>
 
 #include <AP_HAL/AP_HAL.h>
@@ -39,11 +40,14 @@
 
 #include "AP_InertialSensor_BMI160.h"
 
+#define BMI160_INT1_GPIO -1
+
 /* Registers and bits definitions. The indented ones are the bits for the upper
  * register. */
 #define BMI160_REG_CHIPID 0x00
 #define     BMI160_CHIPID 0xD1
 #define BMI160_REG_ERR_REG 0x02
+#define BMI160_REG_AUX_DATA 0x04
 #define BMI160_REG_FIFO_LENGTH 0x22
 #define BMI160_REG_FIFO_DATA 0x24
 #define BMI160_REG_ACC_CONF 0x40
@@ -54,10 +58,18 @@
 #define BMI160_REG_GYR_CONF 0x42
 #define BMI160_REG_GYR_RANGE 0x43
 #define     BMI160_GYR_RANGE_2000DPS 0x00
+#define BMI160_REG_MAG_CONF 0x44
+#define     BMI160_MAG_CONF_ODR_100HZ 0x08
 #define BMI160_REG_FIFO_CONFIG_0 0x46
 #define BMI160_REG_FIFO_CONFIG_1 0x47
 #define     BMI160_FIFO_ACC_EN 0x40
 #define     BMI160_FIFO_GYR_EN 0x80
+#define BMI160_REG_MAG_IF_0 0x4B
+#define BMI160_REG_MAG_IF_1 0x4C
+#define     BMI_MAG_IF_1_MANUAL 0x80
+#define BMI160_REG_MAG_IF_2 0x4D
+#define BMI160_REG_MAG_IF_3 0x4E
+#define BMI160_REG_MAG_IF_4 0x4F
 #define BMI160_REG_INT_EN_1 0x51
 #define     BMI160_INT_FWM_EN 0x40
 #define BMI160_REG_INT_OUT_CTRL 0x53
@@ -79,6 +91,8 @@
 /* Datasheet says that the device powers up in less than 10ms, so waiting for
  * 10 ms before initialization is enough. */
 #define BMI160_POWERUP_DELAY_MSEC 10
+/* Communication delay on the auxiliar interface */
+#define BMI160_AUX_COM_DELAY 10
 /* TODO: Investigate this. The delay below is way too high and with that
  * there's still at least 1% of failures on initialization. Lower values
  * increase that percentage. */
@@ -137,8 +151,8 @@ AP_InertialSensor_BMI160::AP_InertialSensor_BMI160(AP_InertialSensor &imu,
 }
 
 AP_InertialSensor_Backend *
-AP_InertialSensor_BMI160::probe(AP_InertialSensor &imu,
-                                AP_HAL::OwnPtr<AP_HAL::SPIDevice> dev)
+AP_InertialSensor_BMI160::probe(AP_InertialSensor &imu, AP_HAL::OwnPtr<AP_HAL::SPIDevice> dev,
+                                enum Rotation rotation)
 {
     if (!dev) {
         return nullptr;
@@ -502,6 +516,11 @@ bool AP_InertialSensor_BMI160::_init()
     return ret;
 }
 
+bool AP_InertialSensor_BMI160::_has_auxiliary_bus()
+{
+    return _dev->bus_type() != AP_HAL::Device::BUS_TYPE_I2C;
+}
+
 AuxiliaryBus *AP_InertialSensor_BMI160::get_auxiliary_bus()
 {
     if (_auxiliary_bus) {
@@ -515,43 +534,59 @@ AuxiliaryBus *AP_InertialSensor_BMI160::get_auxiliary_bus()
     return _auxiliary_bus;
 }
 
+bool AP_InertialSensor_BMI160::_block_read(uint8_t reg, uint8_t *buf, uint32_t size) {
+    return _dev->read_registers(reg, buf, size);
+}
+
+uint8_t AP_InertialSensor_BMI160::_register_read(uint8_t reg) {
+    uint8_t val = 0;
+    _dev->read_registers(reg, &val, 1);
+    return val;
+}
+
+void AP_InertialSensor_BMI160::_register_write(uint8_t reg, uint8_t val, bool checked) {
+    _dev->write_register(reg, val, checked);
+}
+
 
 AP_BMI160_AuxiliaryBusSlave::AP_BMI160_AuxiliaryBusSlave(AuxiliaryBus &bus, uint8_t addr,
                                                          uint8_t instance)
     : AuxiliaryBusSlave(bus, addr, instance)
-    , _mpu_addr(MPUREG_I2C_SLV0_ADDR + _instance * 3)
-    , _mpu_reg(_mpu_addr + 1)
-    , _mpu_ctrl(_mpu_addr + 2)
-    , _mpu_do(MPUREG_I2C_SLV0_DO + _instance)
 {
 }
 
-int AP_BMI160_AuxiliaryBusSlave::_set_passthrough(uint8_t reg, uint8_t size,
-                                                  uint8_t *out)
-{
-    auto &backend = AP_InertialSensor_Invensense::from(_bus.get_backend());
-    uint8_t addr;
-
-    /* Ensure the slave read/write is disabled before changing the registers */
-    backend._register_write(_mpu_ctrl, 0);
-
-    if (out) {
-        backend._register_write(_mpu_do, *out);
-        addr = _addr;
-    } else {
-        addr = _addr | BIT_READ_FLAG;
+// map the size to the burst lenght
+int AP_BMI160_AuxiliaryBusSlave::_map_read_len(uint8_t size, enum MagIfReadBurst *burst) {
+    if (!size)
+        return -1;
+    
+    if (size <= 1) {
+        *burst = MagIfReadBurst_1;
+        return 1;
+    }
+    else if (size <= 2) {
+        *burst = MagIfReadBurst_2;
+        return 2;
+    }
+    else if (size <= 6) {
+        *burst = MagIfReadBurst_6;
+        return 6;
+    } 
+    else {
+        *burst = MagIfReadBurst_8;
+        return 8;
     }
 
-    backend._register_write(_mpu_addr, addr);
-    backend._register_write(_mpu_reg, reg);
-    backend._register_write(_mpu_ctrl, BIT_I2C_SLVX_EN | size);
-
-    return 0;
+    return -1;
 }
 
 int AP_BMI160_AuxiliaryBusSlave::passthrough_read(uint8_t reg, uint8_t *buf,
                                                    uint8_t size)
 {
+    enum MagIfReadBurst burst;
+    int8_t map_len;
+    uint8_t reg_addr = reg;
+
     assert(buf);
 
     if (_registered) {
@@ -559,44 +594,97 @@ int AP_BMI160_AuxiliaryBusSlave::passthrough_read(uint8_t reg, uint8_t *buf,
         return -1;
     }
 
-    int r = _set_passthrough(reg, size);
-    if (r < 0) {
-        return r;
-    }
+    auto &backend = AP_InertialSensor_BMI160::from(_bus.get_backend());
+
+    // get the needed burst size
+    map_len = _map_read_len(size, &burst);
+    if(map_len < 0)
+        return -1;
+
+    // setup the interface
+    backend._register_write(BMI160_REG_MAG_IF_1, BMI_MAG_IF_1_MANUAL | burst);
 
     /* wait the value to be read from the slave and read it back */
-    hal.scheduler->delay(10);
+    hal.scheduler->delay(BMI160_AUX_COM_DELAY);
 
-    auto &backend = AP_InertialSensor_Invensense::from(_bus.get_backend());
-    if (!backend._block_read(MPUREG_EXT_SENS_DATA_00 + _ext_sens_data, buf, size)) {
-        return -1;
+    for(uint8_t count = 0; count < size;) {
+        /* set address to read */
+        backend._register_write(BMI160_REG_MAG_IF_2, reg_addr);
+        hal.scheduler->delay(BMI160_AUX_COM_DELAY);
+        uint8_t len;
+
+        if(size < map_len)
+            len = size;
+        else if ((size - count) < map_len)
+            len = (size - count);
+        else
+            len = map_len;
+
+        if(!backend._block_read(BMI160_REG_AUX_DATA, buf + count, len))
+            return -1;
+        reg_addr += map_len;
+        count += map_len;
     }
 
     /* disable new reads */
-    backend._register_write(_mpu_ctrl, 0);
+    backend._register_write(BMI160_REG_MAG_IF_1, burst);
 
     return size;
 }
 
 int AP_BMI160_AuxiliaryBusSlave::passthrough_write(uint8_t reg, uint8_t val)
 {
+    uint8_t mag_if1;
+
+    if (_registered) {
+        hal.console->printf("Error: can't passthrough when slave is already configured\n");
+        return -1;
+    }
+    auto &backend = AP_InertialSensor_BMI160::from(_bus.get_backend());
+
+    if (!backend._block_read(BMI160_REG_MAG_IF_1, &mag_if1, 1))
+        return -1;
+
+    backend._register_write(BMI160_REG_MAG_IF_1, mag_if1 | BMI_MAG_IF_1_MANUAL);
+    hal.scheduler->delay(BMI160_AUX_COM_DELAY);
+
+    backend._register_write(BMI160_REG_MAG_IF_3, val);
+    backend._register_write(BMI160_REG_MAG_IF_2, reg);
+
+    /* wait the value to be written to the slave */
+    hal.scheduler->delay(BMI160_AUX_COM_DELAY);
+
+    /* disable new writes */
+    backend._register_write(BMI160_REG_MAG_IF_1, mag_if1 & (~BMI_MAG_IF_1_MANUAL));
+
+    return 1;
+}
+
+int AP_BMI160_AuxiliaryBusSlave::_set_passthrough(uint8_t reg, uint8_t size) {
     if (_registered) {
         hal.console->printf("Error: can't passthrough when slave is already configured\n");
         return -1;
     }
 
-    int r = _set_passthrough(reg, 1, &val);
-    if (r < 0) {
-        return r;
+    if (size > 8) {
+        hal.console->printf("Error: we do not support more than 8 byte reads\n");
+        return -1;
     }
 
-    /* wait the value to be written to the slave */
-    hal.scheduler->delay(10);
+    auto &backend = AP_InertialSensor_BMI160::from(_bus.get_backend());
 
-    auto &backend = AP_InertialSensor_Invensense::from(_bus.get_backend());
+    enum MagIfReadBurst burst;
+    // get the needed burst size
+    _map_read_len(size, &burst);
 
-    /* disable new writes */
-    backend._register_write(_mpu_ctrl, 0);
+    backend._register_write(BMI160_REG_MAG_IF_2, reg);
+
+    // fix refresh rate to 100 Hz
+    backend._register_write(BMI160_REG_MAG_CONF, BMI160_MAG_CONF_ODR_100HZ);
+
+    // enable auto mode
+    backend._register_write(BMI160_REG_MAG_IF_1, burst);
+    hal.scheduler->delay(BMI160_AUX_COM_DELAY);
 
     return 1;
 }
@@ -608,8 +696,8 @@ int AP_BMI160_AuxiliaryBusSlave::read(uint8_t *buf)
         return -1;
     }
 
-    auto &backend = AP_InertialSensor_Invensense::from(_bus.get_backend());
-    if (!backend._block_read(MPUREG_EXT_SENS_DATA_00 + _ext_sens_data, buf, _sample_size)) {
+    auto &backend = AP_InertialSensor_BMI160::from(_bus.get_backend());
+    if (!backend._block_read(BMI160_REG_AUX_DATA, buf, _sample_size)) {
         return -1;
     }
 
@@ -618,64 +706,40 @@ int AP_BMI160_AuxiliaryBusSlave::read(uint8_t *buf)
 
 /* Invensense provides up to 5 slave devices, but the 5th is way too different to
  * configure and is seldom used */
-AP_BMI160_AuxiliaryBus::AP_BMI160_AuxiliaryBus(AP_InertialSensor_Invensense &backend, uint32_t devid)
-    : AuxiliaryBus(backend, 4, devid)
+AP_BMI160_AuxiliaryBus::AP_BMI160_AuxiliaryBus(AP_InertialSensor_BMI160 &backend, uint32_t devid)
+    : AuxiliaryBus(backend, 1, devid)
 {
 }
 
 AP_HAL::Semaphore *AP_BMI160_AuxiliaryBus::get_semaphore()
 {
-    return static_cast<AP_BMI160_Invensense&>(_ins_backend)._dev->get_semaphore();
+    return static_cast<AP_InertialSensor_BMI160&>(_ins_backend)._dev->get_semaphore();
 }
 
 AuxiliaryBusSlave *AP_BMI160_AuxiliaryBus::_instantiate_slave(uint8_t addr, uint8_t instance)
 {
     /* Enable slaves on Invensense if this is the first time */
-    if (_ext_sens_data == 0) {
-        _configure_slaves();
-    }
+    _configure_slaves(addr);
 
     return new AP_BMI160_AuxiliaryBusSlave(*this, addr, instance);
 }
 
-void AP_BMI160_AuxiliaryBus::_configure_slaves()
+void AP_BMI160_AuxiliaryBus::_configure_slaves(uint8_t addr)
 {
     auto &backend = AP_InertialSensor_BMI160::from(_ins_backend);
     uint8_t if_conf = 0;
-    bool ret;
 
     backend._dev->get_semaphore()->take_blocking();
 
     /* set the aux power mode to normal */
     backend._dev->write_register(BMI160_REG_CMD,
                                  BMI160_CMD_AUX_NORMAL_MODE);
-    backend.hal.scheduler->delay(BMI160_POWERUP_DELAY_MSEC);
+    hal.scheduler->delay(BMI160_AUX_COM_DELAY);
 
     /* Enable second interface in I2C mode */
     backend._dev->read_registers(BMI160_REG_IF_CONF, &if_conf, 1);
     if_conf |= (1 << 5);
     backend._dev->write_register(BMI160_REG_IF_CONF, if_conf);
-
-    
-
-    /* Enable the I2C master to slaves on the auxiliary I2C bus*/
-    if (!(backend._last_stat_user_ctrl & BIT_USER_CTRL_I2C_MST_EN)) {
-        backend._last_stat_user_ctrl |= BIT_USER_CTRL_I2C_MST_EN;
-        backend._register_write(MPUREG_USER_CTRL, backend._last_stat_user_ctrl);
-    }
-
-    /* stop condition between reads; clock at 400kHz */
-    backend._register_write(MPUREG_I2C_MST_CTRL,
-                            BIT_I2C_MST_P_NSR | BIT_I2C_MST_CLK_400KHZ);
-
-    /* Hard-code divider for internal sample rate, 1 kHz, resulting in a
-     * sample rate of 100Hz */
-    backend._register_write(MPUREG_I2C_SLV4_CTRL, 9);
-
-    /* All slaves are subject to the sample rate */
-    backend._register_write(MPUREG_I2C_MST_DELAY_CTRL,
-                            BIT_I2C_SLV0_DLY_EN | BIT_I2C_SLV1_DLY_EN |
-                            BIT_I2C_SLV2_DLY_EN | BIT_I2C_SLV3_DLY_EN);
 
     backend._dev->get_semaphore()->give();
 }
@@ -683,21 +747,15 @@ void AP_BMI160_AuxiliaryBus::_configure_slaves()
 int AP_BMI160_AuxiliaryBus::_configure_periodic_read(AuxiliaryBusSlave *slave,
                                                      uint8_t reg, uint8_t size)
 {
-    if (_ext_sens_data + size > MAX_EXT_SENS_DATA) {
-        return -1;
-    }
-
     AP_BMI160_AuxiliaryBusSlave *mpu_slave =
         static_cast<AP_BMI160_AuxiliaryBusSlave*>(slave);
     mpu_slave->_set_passthrough(reg, size);
-    mpu_slave->_ext_sens_data = _ext_sens_data;
-    _ext_sens_data += size;
 
     return 0;
 }
 
 AP_HAL::Device::PeriodicHandle AP_BMI160_AuxiliaryBus::register_periodic_callback(uint32_t period_usec, AP_HAL::Device::PeriodicCb cb)
 {
-    auto &backend = AP_InertialSensor_Invensense::from(_ins_backend);
+    auto &backend = AP_InertialSensor_BMI160::from(_ins_backend);
     return backend._dev->register_periodic_callback(period_usec, cb);
 }

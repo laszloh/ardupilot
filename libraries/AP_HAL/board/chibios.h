@@ -90,6 +90,9 @@
 #define HAL_INS_ICM20608_AM_NAME "icm20608-am"
 #define HAL_INS_ICM20608_EXT_NAME "icm20608_ext"
 
+#define HAL_INS_BMI160_NAME "bmi160"
+#define HAL_INS_BMX160_NAME "bmx160"
+
 #define HAL_COMPASS_HMC5843_NAME "hmc5843"
 #define HAL_COMPASS_LIS3MDL_NAME "lis3mdl"
 

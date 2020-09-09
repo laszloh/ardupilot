@@ -20,6 +20,7 @@
 
 #include "AP_InertialSensor.h"
 #include "AP_InertialSensor_Backend.h"
+#include "AuxiliaryBus.h"
 
 class AP_BMI160_AuxiliaryBus;
 class AP_BMI160_AuxiliaryBusSlave;
@@ -29,8 +30,12 @@ class AP_InertialSensor_BMI160 : public AP_InertialSensor_Backend {
     friend AP_BMI160_AuxiliaryBusSlave;
 
 public:
-    static AP_InertialSensor_Backend *probe(AP_InertialSensor &imu,
-                                            AP_HAL::OwnPtr<AP_HAL::SPIDevice> dev);
+    static AP_InertialSensor_Backend *probe(AP_InertialSensor &imu, AP_HAL::OwnPtr<AP_HAL::SPIDevice> dev,
+                                            enum Rotation rotation);
+
+    static AP_InertialSensor_BMI160 &from(AP_InertialSensor_Backend &backend) {
+        return static_cast<AP_InertialSensor_BMI160&>(backend);
+    }
 
     /**
      * Configure the sensors and start reading routine.
@@ -44,12 +49,11 @@ public:
      */
     AuxiliaryBus *get_auxiliary_bus() override;
 
-    // get a startup banner to output to the GCS
-    bool get_output_banner(char* banner, uint8_t banner_len) override;
-
 private:
     AP_InertialSensor_BMI160(AP_InertialSensor &imu,
                              AP_HAL::OwnPtr<AP_HAL::Device> dev);
+
+    bool _has_auxiliary_bus();
 
     /**
      * If the macro BMI160_DEBUG is defined, check if there are errors reported
@@ -75,6 +79,12 @@ private:
      * @return true on success, false otherwise.
      */
     bool _init();
+
+    bool _block_read(uint8_t reg, uint8_t *buf, uint32_t size);
+
+    uint8_t _register_read(uint8_t reg);
+
+    void _register_write(uint8_t reg, uint8_t val, bool checked=false);
 
     /**
      * Configure accelerometer sensor. The device semaphore must already be
@@ -118,7 +128,7 @@ private:
     void _read_fifo();
 
     AP_HAL::OwnPtr<AP_HAL::Device> _dev;
-    AP_BMI160_AuxiliaryBusSlave *_auxiliary_bus;
+    AP_BMI160_AuxiliaryBus *_auxiliary_bus;
 
     uint8_t _accel_instance;
     float _accel_scale;
@@ -141,35 +151,35 @@ public:
 
 protected:
     AP_BMI160_AuxiliaryBusSlave(AuxiliaryBus &bus, uint8_t addr, uint8_t instance);
-    int _set_passthrough(uint8_t reg, uint8_t size, uint8_t *out = nullptr);
+    int _set_passthrough(uint8_t reg, uint8_t size);
 
 private:
-    const uint8_t _mpu_addr;
-    const uint8_t _mpu_reg;
-    const uint8_t _mpu_ctrl;
-    const uint8_t _mpu_do;
+    enum MagIfReadBurst {
+        MagIfReadBurst_1    = 0x00,
+        MagIfReadBurst_2    = 0x01,
+        MagIfReadBurst_6    = 0x02,
+        MagIfReadBurst_8    = 0x03
+    };
 
-    uint8_t _ext_sens_data = 0;
+    int _map_read_len(uint8_t size, enum MagIfReadBurst *burst);
+
 };
 
 class AP_BMI160_AuxiliaryBus : public AuxiliaryBus
 {
-    friend class AP_BMI160_Invensense;
+    friend class AP_InertialSensor_BMI160;
 
 public:
     AP_HAL::Semaphore *get_semaphore() override;
     AP_HAL::Device::PeriodicHandle register_periodic_callback(uint32_t period_usec, AP_HAL::Device::PeriodicCb cb) override;
 
 protected:
-    AP_BMI160_AuxiliaryBus(AP_InertialSensor_Invensense &backend, uint32_t devid);
+    AP_BMI160_AuxiliaryBus(AP_InertialSensor_BMI160 &backend, uint32_t devid);
 
     AuxiliaryBusSlave *_instantiate_slave(uint8_t addr, uint8_t instance) override;
     int _configure_periodic_read(AuxiliaryBusSlave *slave, uint8_t reg,
                                  uint8_t size) override;
 
 private:
-    void _configure_slaves();
-
-    static const uint8_t MAX_EXT_SENS_DATA = 24;
-    uint8_t _ext_sens_data = 0;
+    void _configure_slaves(uint8_t addr);
 };
